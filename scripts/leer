@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 
 import argparse
 import curses
@@ -154,8 +155,6 @@ def curses_main(stdscr, args):
     thread.start()
 
     key = curses.KEY_BEG
-
-    query = None
 
     while True:
       stdscr.clear()
