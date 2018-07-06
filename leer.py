@@ -1,0 +1,232 @@
+
+import argparse
+import curses
+import datetime
+import itertools
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import threading
+import time
+
+
+def main():
+  p = argparse.ArgumentParser(
+    description='''
+       leer runs command repeatedly, displaying its output and errors (you can scroll through the output).
+       This allows you to watch the program output change over time.
+       By default, command is run every 2 seconds and watch will run until interrupted.
+    ''',
+    usage='''%(prog)s [options] command ...''',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+  )
+
+  def print_help(file=None):
+    '''
+      Work around a bug in argparse (https://bugs.python.org/issue13041)
+      which causes it to assume a 80 column terminal in all common modern environments.
+    '''
+
+    COLUMNS = os.environ.get('COLUMNS')
+    try:
+      if COLUMNS is None:
+        os.environ['COLUMNS'] = str(shutil.get_terminal_size().columns)
+
+      argparse.ArgumentParser.print_help(p, file)
+    finally:
+      if COLUMNS is None:
+        os.environ.pop('COLUMNS')
+
+  p.print_help = print_help
+
+  p.add_argument(
+    '-d', '--differences', metavar='permanent',
+    nargs='?', default=False,
+    help='''
+      Highlight the differences between the output of successive runs of command.
+      This option has an optional argument that changes highlight to be permanent,
+      allowing to see what has changed at least once since the first iteration.
+    '''
+  )
+
+  def interval_parser(txt):
+    try:
+      f = float(txt.replace(',', '.'))
+      if f < 0:
+        raise argparse.ArgumentTypeError('time interval cannot be negative')
+      return f
+    except ValueError:
+      raise argparse.ArgumentTypeError(repr(txt) + ' is not a valid float')
+
+  interval_parser.__name__ = 'interval'
+
+  p.add_argument(
+    '-n', '--interval', metavar='seconds',
+    type=interval_parser, default=2,
+    help='''
+      Specify update interval in seconds. Both '.' and ',' work for any locales.
+    '''
+  )
+
+  p.add_argument(
+    '-l', '--line-numbers',
+    action='store_true', default=False,
+    help='''
+      Display line numbers for command output.
+    '''
+  )
+
+  p.add_argument(
+    'command',
+    nargs='+',
+    help=argparse.SUPPRESS,
+  )
+
+  args = p.parse_args()
+
+  curses.wrapper(curses_main, args)
+
+
+class State:
+  def __init__(self):
+    self.text_buffer = []
+    self.returncode  = 0
+    self.job_start   = time.monotonic()
+
+
+def worker(*, cmd: [str], start_time: float, interval: float, state: State):
+  for i in itertools.count():
+    next_job_start = start_time + interval * i
+    now = time.monotonic()
+
+    ## even if we are ready for another command we do a `sleep(0)`
+    ## to give other threads a chance to run
+    delay = max(0, next_job_start - now)
+    time.sleep(delay)
+
+    proc = subprocess.Popen(
+      cmd,
+      shell=True,
+      stderr=subprocess.STDOUT,
+      stdout=subprocess.PIPE,
+      universal_newlines=True,
+    )
+
+    state.job_start = time.monotonic()
+
+    state.text_buffer.clear()
+
+    for line in proc.stdout:
+      if not line:
+        break
+
+      state.text_buffer.append(line)
+
+      # signal curses thread that input has arrived
+      signal.pthread_kill(threading.main_thread().ident, signal.SIGWINCH)
+
+    # wait for child to finish
+    state.returncode = proc.wait()
+
+    # signal curses thread that we are done
+    signal.pthread_kill(threading.main_thread().ident, signal.SIGWINCH)
+
+
+def curses_main(stdscr, args):
+  ## hide cursor
+  curses.curs_set(False)
+
+  first_line_shown = 0
+
+  start_abs = time.time()
+  state     = State()
+  start_rel = state.job_start
+
+  for run in range(1):
+    thread = threading.Thread(target=worker, daemon=True, kwargs=dict(
+      cmd        = args.command,
+      start_time = start_rel,
+      interval   = args.interval,
+      state      = state,
+    ))
+    thread.start()
+
+    key = curses.KEY_BEG
+
+    query = None
+
+    while True:
+      stdscr.clear()
+
+      y, x = stdscr.getmaxyx()
+
+      # clamp first_line_shown so we always see some command output
+      first_line_shown = max(min(first_line_shown, len(state.text_buffer) - y + 3), 0)
+
+      output_window_size = max(0, y - 6)
+
+      try:
+        bgn = f'Every {args.interval}s: ' + ' '.join(args.command)
+        end = (
+          platform.node() +
+          ': ' +
+          datetime.datetime.fromtimestamp(start_abs + state.job_start - start_rel).strftime('%c').strip()
+        )
+
+        bgn = bgn[:x // 2]
+        end = end[:x // 2]
+
+        msg = bgn + ' ' * (x - len(bgn + end)) + end
+
+        stdscr.insstr(0, 0, msg)
+
+        stdscr.move(2, 0)
+        for i in range(first_line_shown, len(state.text_buffer)):
+          if args.line_numbers:
+            stdscr.addstr('%5d ' % (i + 1), curses.A_BOLD)
+
+          stdscr.addstr(state.text_buffer[i])
+      except curses.error as e:
+        pass
+
+      key = stdscr.getch()
+
+      if key == curses.KEY_RESIZE:
+        new_y, new_x = stdscr.getmaxyx()
+        if new_y != y or new_x != x:
+          stdscr.clear()
+          curses.resizeterm(new_y, new_x)
+          stdscr.refresh()
+          y, x = new_y, new_x
+      elif key == curses.KEY_DOWN:
+        first_line_shown += 1
+      elif key == curses.KEY_UP:
+        first_line_shown -= 1
+      elif key == curses.KEY_PPAGE:
+        first_line_shown -= output_window_size
+      elif key == curses.KEY_NPAGE:
+        first_line_shown += output_window_size
+      elif key == ord('g'):
+        first_line_shown = 0
+      elif key == ord('G'):
+        first_line_shown = len(state.text_buffer)
+      # elif key == ord('/'):
+      #   try:
+      #     stdscr.move(1, 0)
+      #     stdscr.clrtoeol()
+      #     stdscr.addstr('/ ')
+      #     curses.curs_set(True)
+      #     curses.echo()
+      #     query = stdscr.getstr(1, 2)
+      #   finally:
+      #     curses.noecho()
+      #     curses.curs_set(False)
+
+
+if __name__ == '__main__':
+  try:
+    main()
+  except KeyboardInterrupt:
+    pass
